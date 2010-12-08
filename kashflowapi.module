@@ -1,0 +1,681 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Provides a limited PHP interface to the KashFlow SOAP API.
+ *
+ * Sponsored by Ecobee Ltd, http://ecobee.org
+ *
+ * Written by crantok and ecofinn,
+ * with thanks to Peter Bowen for his post at
+ * http://forums.kashflow.co.uk/developers-forum/519-php-examples.html
+ *
+ * This module relies on the php SOAP extension.
+ */
+
+/**
+ * Implementation of hook_perm().
+ */
+function kashflowapi_perm() {
+  return array('administer kashflow api');
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function kashflowapi_menu() {
+
+  $items['admin/settings/kashflow'] = array(
+    'title' => 'KashFlow settings',
+    'description' => "KashFlow modules' configuration.",
+    'page callback' => '_kf_top_level_page',
+    'access arguments' => array('administer kashflow api'),
+  );
+
+  $items['admin/settings/kashflow/api'] = array(
+    'title' => 'Configure API',
+    'description' =>  'Set KashFlow login details.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('kashflowapi_settings_form'),
+    'access arguments' => array('administer kashflow api'),
+  );
+
+  return $items;
+}
+
+/*
+ * Stub page for the top level KashFlow settings menu page
+ *
+ */
+function _kf_top_level_page() {
+  // @todo List various KashFlow modules' settings pages.
+  return '';
+}
+
+/*
+ * Form builder for the Kashflow admin page at admin/settings/kashflow/api
+ *
+ * @ingroup forms
+ */
+function kashflowapi_settings_form() {
+
+  $form['kashflowapi_username'] = array(
+    '#title' => t('Kashflow user name'),
+    '#type' => 'textfield',
+    '#description' => t('The username provided by Kashflow when you set up an account.'),
+    '#default_value' => variable_get('kashflowapi_username', ''),
+  );
+  $form['kashflowapi_password'] = array(
+    '#title' => t('Kashflow password'),
+    '#type' => 'password',
+    '#description' => t('The password provided by Kashflow when you set up an account.'),
+    '#default_value' => '',
+  );
+
+  // @todo : Change over to a normal form with a submit fn in order to
+  // check kashflow login after submission.
+  return system_settings_form($form);
+}
+
+/**
+ * Returns KashFlow login details.
+ *
+ * Login details are required by any function that wants to make a SOAP call.
+ *
+ * @return
+ *   An array containing the Kashflow username and password.
+ */
+function _kashflowapi_get_login_args() {
+
+  static $result;
+
+  if (!isset($result)) {
+    $result = array(
+      "UserName" => variable_get('kashflowapi_username', ''),
+      "Password" => variable_get('kashflowapi_password', ''),
+    );
+  }
+
+  return $result;
+}
+
+/**
+ * Extends the PHP SOAP extension class SoapClient (for KashFlow).
+ *
+ * Changes the format of SOAP requests so that KashFlow accepts them and adds
+ * error handling code. It also provides a way of removing valueless elements
+ * from the SOAP request.
+ */
+class KashFlowSoapClient extends SoapClient {
+
+  private $namespace;
+
+  /**
+   * Changes SOAP request format so that KashFlow's API will accept it.
+   *
+   * Also provides a way or removing valueless elements from the SOAP request.
+   * Overrides inherited method SoapClient::__doRequest()
+   */
+  function __doRequest($request, $location, $action, $version) {
+
+    // Rewrite the opening tag of the XML element that contains the name of the
+    // soap call so that
+    //    <ns1:NameOfSoapCall>
+    // becomes
+    //    <NameOfSoapCall xmlns="$this->namespace">
+    $request = preg_replace('/<ns1:(\w+)/', '<$1 xmlns="' . $this->namespace . '"', $request, 1);
+
+    // Having made the KashFlow namespace explicit inside the Body of the SOAP
+    // Envelope, there is no need to use a namespace prefix before each SOAP
+    // call argument element, so...
+
+    // ...remove all namespace prefixes from SOAP call argument opening tags,...
+    $request = preg_replace('/<ns1:(\w+)/', '<$1', $request);
+
+    // ...remove all namespace prefixes from SOAP call argument closing tags
+    // and remove the original KashFlow namespace declaration from the Envelope
+    // element.
+    $request = str_replace(array('/ns1:', 'xmlns:ns1="' . $this->namespace . '"'), array('/', ''), $request);
+
+    // @ SYMBOLS: The PHP SOAP extension requires that all SOAP fields are set
+    // in the argument array BUT KashFlow does not care whether non-essential
+    // fields are missing. Setting the value of a field to '@' satisfies the
+    // SOAP extension and saves having to manufacture values for irrelevant
+    // fields.
+
+    // This line removes any elements whose value is the @ symbol.
+    $request = preg_replace('#<\w+>@</\w+>#', '', $request);
+
+    return parent::__doRequest($request, $location, $action, $version);
+  }
+
+  /**
+   * An overide to ensure consistent error handling within this module.
+   *
+   * Overrides inherited method SoapClient::__call() which is called whenever
+   * client code calls:
+   *   instanceOfKashFlowSoapClient->NameOfKashFlowSoapCall()
+   * Creates and returns an object containing error details if the overriden
+   * method raises an unhandled exception. The object thus created 'looks'
+   * like the object normally returned by SoapClient::__call()
+   */
+  function __call($function_name, $arguments) {
+
+    // Wrap a call to the overriden method with an exception handler.
+    try {
+        $result = parent::__call($function_name, $arguments);
+    }
+    catch (Exception $e) {
+      // Create an object that 'looks' like the type of object normally
+      // returned by the overriden method.
+      $result = new stdClass();
+      $result->Status = 'Fail';
+      $result->StatusDetail = $e->getMessage();
+    }
+
+    return $result;
+  }
+
+  /**
+   * Set the XML namespace for SOAP calls.
+   *
+   * @param $sNamespace
+   *   A string containing the SOAP call namespace.
+   */
+  function setNamespace($sNamespace) {
+      $this->namespace=$sNamespace;
+  }
+}
+
+/**
+ * Returns an initialised instance of KashFlowSoapClient.
+ *
+ * This fn will only create a client if one does not exist already.
+ *
+ * @return
+ *   an initialised instance of KashFlowSoapClient, or NULL if error.
+ */
+function _kashflowapi_get_soap_client() {
+
+  // A SOAP client instance that will exist while this module stays in memory.
+  static $kfSoapClient;
+
+  // Does the SOAP client already exist?
+  if (!isset($kfSoapClient)) {
+    // No SOAP client exists yet; create one.
+    $kfSoapClient = new KashFlowSoapClient(
+      "https://securedwebapp.com/api/service.asmx?WSDL",
+      _kashflowapi_get_login_args());
+
+    // Was the SOAP client successfully created?
+    if (isset($kfSoapClient)) {
+      $kfSoapClient->setNamespace("KashFlow");
+    }
+    else {
+      $kfSoapClient = NULL;
+    }
+
+  }
+
+  return $kfSoapClient;
+}
+
+/**
+ * Extract SOAP call result, or record an error if SOAP call failed.
+ *
+ * Eliminates boiler-plate code from API fns and ensures that errors are dealt
+ * with consistently.
+ *
+ * @param $soapResult
+ *   The object returned by the SOAP call
+ * @param $internalResultName
+ *   A string containing the internal result name. This is normally the name of
+ *   the SOAP call with 'Result' appended.
+ *
+ * @return
+ *   The internal result if the SOAP call succeeded, else NULL.
+ */
+function _kashflowapi_extract_result($soapResult, $internalResultName) {
+
+  // Was the SOAP call successful?
+  if ($soapResult && ($soapResult->Status == 'OK')) {
+
+    $internalResult = eval('return $soapResult->' . $internalResultName . ';');
+
+    // If the internal result is NULL, 0 or false (none of
+    // which are useful return results) then return true instead.
+    return $internalResult ? $internalResult : TRUE;
+
+  }
+  else {
+    // The SOAP call failed. Extract error detail if it exists.
+
+    // Did the SOAP call return anything at all?
+    if ($soapResult) {
+      kashflowapi_latest_error($soapResult->StatusDetail);
+    }
+    else {
+      kashflowapi_latest_error('No SOAP result returned');
+    }
+
+    return NULL;
+  }
+}
+
+/**
+ * Get or set the latest error recorded in this module.
+ *
+ * @param $error
+ *   a string containing the latest error (in set mode), or
+ *   an empty string (in get mode)
+ *
+ * @return
+ *   A string containing the latest error
+ */
+function kashflowapi_latest_error($error = '') {
+
+  static $latestError = '';
+
+  if ($error != '') {
+    $latestError = $error;
+  }
+
+  return $latestError;
+}
+
+/**
+ * Get a KashFlow customer from an email address
+ *
+ * @param $email
+ *   the email address of the to-be-retrieved customer
+ *
+ * @return
+ *   an object containing details of a KashFlow customer, or NULL on error
+ */
+function kashflowapi_get_customer_by_email($email) {
+
+  $client = _kashflowapi_get_soap_client();
+
+  $customer_args= array('CustomerEmail' => $email);
+
+  $result = $client->GetCustomerByEmail(array_merge(_kashflowapi_get_login_args() , $customer_args));
+
+  return _kashflowapi_extract_result($result, 'GetCustomerByEmailResult');
+
+}
+
+/**
+ * Get a KashFlow customer from a unique KashFlow customer ID
+ *
+ * @param $kfCustID
+ *   the unique KashFlow ID of the to-be-retrieved customer
+ *
+ * @return
+ *   an object containing details of a KashFlow customer, or NULL on error
+ */
+function kashflowapi_get_customer_by_id($kfCustID) {
+
+  $client = _kashflowapi_get_soap_client();
+
+  $customer_args= array('CustomerID' => $kfCustID);
+
+  $result = $client->GetCustomerByID(array_merge(_kashflowapi_get_login_args() , $customer_args));
+
+  return _kashflowapi_extract_result($result, 'GetCustomerByIDResult');
+
+}
+
+/**
+ * Create a new customer in KashFlow.
+ *
+ * The 'Updated' and 'Created' dates will be set to today's date unless values
+ * are supplied for these keys in the $customerDetails parameter.
+ *
+ * @param $customerDetails
+ *   An array containing values for one or more of the following keys.
+ *   Other keys will be ignored.
+ *   'Code' =>      Alphanumeric customer code
+ *   'Name' =>      Customer name
+ *   'Contact' =>   Customer contact name
+ *   'Telephone' => Customer contact telephone number
+ *   'Mobile' =>    Customer contact mobile telephone number
+ *   'Fax' =>       Customer contact fax number
+ *   'Email' =>     Customer contact email address
+ *   'Address1' =>  Customer address line 1
+ *   'Address2' =>  Customer address line 2
+ *   'Address3' =>  Customer address line 3
+ *   'Address4' =>  Customer address line 4
+ *   'Postcode' =>  Customer address postcode
+ *   'Website' =>   Customer website
+ *   'EC' =>
+ *   'OutsideEC' =>
+ *   'Notes' =>
+ *   'Source' =>
+ *   'Discount' => Discount on sales to customer
+ *   'ShowDiscount' => Whether to show discount in invoice line descriptions
+ *   'PaymentTerms' =>
+ *   'ExtraText1' =>
+ *   'ExtraText2' =>
+ *   'CheckBox1' =>
+ *   'CheckBox2' =>
+ *   'Created' => Date that customer entry was created (today by default)
+ *   'Updated' => Date that customer entry was last updated (today by default)
+ *   'CurrencyID' =>
+ *
+ * @return
+ *   the unique KashFlow ID of the newly created customer, or NULL on error
+ */
+function kashflowapi_add_customer($customerDetails) {
+
+  if (!$customerDetails || !is_array($customerDetails) || (count($customerDetails)==0)) {
+    kashflowapi_latest_error('Invalid $customerDetails array');
+    return NULL;
+  }
+
+  // set the date as now
+  $today = date("Y-m-d", mktime());
+
+  // For an explanation of the @ symbols in this array, look for "@ SYMBOLS:"
+  // in KashFlowSoapClient::__doRequest()
+  $customer_args = array("custr" => array(
+    'CustomerID' => '@',
+    'Code' => $customerDetails['Code'] ? $customerDetails['Code'] : '@',
+    'Name' => $customerDetails['Name'] ? $customerDetails['Name'] : '@',
+    'Contact' => $customerDetails['Contact'] ? $customerDetails['Contact'] : '@',
+    'Telephone' => $customerDetails['Telephone'] ? $customerDetails['Telephone'] : '@',
+    'Mobile' => $customerDetails['Mobile'] ? $customerDetails['Mobile'] : '@',
+    'Fax' => $customerDetails['Fax'] ? $customerDetails['Fax'] : '@',
+    'Email' => $customerDetails['Email'] ? $customerDetails['Email'] : '@',
+    'Address1' => $customerDetails['Address1'] ? $customerDetails['Address1'] : '@',
+    'Address2' => $customerDetails['Address2'] ? $customerDetails['Address2'] : '@',
+    'Address3' => $customerDetails['Address3'] ? $customerDetails['Address3'] : '@',
+    'Address4' => $customerDetails['Address4'] ? $customerDetails['Address4'] : '@',
+    'Postcode' => $customerDetails['Postcode'] ? $customerDetails['Postcode'] : '@',
+    'Website' => $customerDetails['Website'] ? $customerDetails['Website'] : '@',
+    'EC' => $customerDetails['EC'] ? $customerDetails['EC'] : '@',
+    'OutsideEC' => $customerDetails['OutsideEC'] ? $customerDetails['OutsideEC'] : '@',
+    'Notes' => $customerDetails['Notes'] ? $customerDetails['Notes'] : '@',
+    'Source' => $customerDetails['Source'] ? $customerDetails['Source'] : '@',
+    'Discount' => $customerDetails['Discount'] ? $customerDetails['Discount'] : '@',
+    'ShowDiscount' => $customerDetails['ShowDiscount'] ? $customerDetails['ShowDiscount'] : '@',
+    'PaymentTerms' => $customerDetails['PaymentTerms'] ? $customerDetails['PaymentTerms'] : '@',
+    'ExtraText1' => $customerDetails['ExtraText1'] ? $customerDetails['ExtraText1'] : '@',
+    'ExtraText2' => $customerDetails['ExtraText2'] ? $customerDetails['ExtraText2'] : '@',
+    'CheckBox1' => $customerDetails['CheckBox1'] ? $customerDetails['CheckBox1'] : '@',
+    'CheckBox2' => $customerDetails['CheckBox2'] ? $customerDetails['CheckBox2'] : '@',
+    'Created' => $customerDetails['Created'] ? $customerDetails['Created'] : $today,
+    'Updated' => $customerDetails['Updated'] ? $customerDetails['Updated'] : $today,
+    'CurrencyID' => $customerDetails['CurrencyID'] ? $customerDetails['CurrencyID'] : '@'
+  ));
+
+  $client = _kashflowapi_get_soap_client();
+
+  $result = $client->InsertCustomer(array_merge(_kashflowapi_get_login_args() , $customer_args));
+
+  return _kashflowapi_extract_result($result, 'InsertCustomerResult');
+}
+
+/**
+ * Update details of a customer in KashFlow.
+ *
+ * The 'Updated' date will be set to today's date unless a value is supplied for
+ * this key in the $customerDetails parameter.
+ *
+ * @param $kfCustID
+ *   The unique KashFlow ID for this customer
+ * @param $customerDetails
+ *   An array containing values for one or more of the following keys.
+ *   Other keys will be ignored.
+ *   'Code' =>      Alphanumeric customer code (NOT the unique customer ID)
+ *   'Name' =>      Customer name
+ *   'Contact' =>   Customer contact name
+ *   'Telephone' => Customer contact telephone number
+ *   'Mobile' =>    Customer contact mobile telephone number
+ *   'Fax' =>       Customer contact fax number
+ *   'Email' =>     Customer contact email address
+ *   'Address1' =>  Customer address line 1
+ *   'Address2' =>  Customer address line 2
+ *   'Address3' =>  Customer address line 3
+ *   'Address4' =>  Customer address line 4
+ *   'Postcode' =>  Customer address postcode
+ *   'Website' =>   Customer website
+ *   'EC' =>
+ *   'OutsideEC' =>
+ *   'Notes' =>
+ *   'Source' =>
+ *   'Discount' => Discount on sales to customer
+ *   'ShowDiscount' => Whether to show discount in invoice line descriptions
+ *   'PaymentTerms' =>
+ *   'ExtraText1' =>
+ *   'ExtraText2' =>
+ *   'CheckBox1' =>
+ *   'CheckBox2' =>
+ *   'Created' => Date that customer entry was created
+ *   'Updated' => Date that customer entry was last updated (today by default)
+ *   'CurrencyID' =>
+ *
+ * @return
+ *   boolean - true if succeeded, else NULL
+ */
+function kashflowapi_update_customer($kfCustID, $customerDetails) {
+
+  if (!$customerDetails || !is_array($customerDetails) || (count($customerDetails)==0)) {
+    kashflowapi_latest_error('Invalid $customerDetails array');
+    return NULL;
+  }
+
+  // set the date as now
+  $today = date("Y-m-d", mktime());
+
+  // For an explanation of the @ symbols in this array, look for "@ SYMBOLS:"
+  // in KashFlowSoapClient::__doRequest()
+  $customer_args = array("custr" => array(
+    'CustomerID' => "$kfCustID",
+    'Code' => $customerDetails['Code'] ? $customerDetails['Code'] : '@',
+    'Name' => $customerDetails['Name'] ? $customerDetails['Name'] : '@',
+    'Contact' => $customerDetails['Contact'] ? $customerDetails['Contact'] : '@',
+    'Telephone' => $customerDetails['Telephone'] ? $customerDetails['Telephone'] : '@',
+    'Mobile' => $customerDetails['Mobile'] ? $customerDetails['Mobile'] : '@',
+    'Fax' => $customerDetails['Fax'] ? $customerDetails['Fax'] : '@',
+    'Email' => $customerDetails['Email'] ? $customerDetails['Email'] : '@',
+    'Address1' => $customerDetails['Address1'] ? $customerDetails['Address1'] : '@',
+    'Address2' => $customerDetails['Address2'] ? $customerDetails['Address2'] : '@',
+    'Address3' => $customerDetails['Address3'] ? $customerDetails['Address3'] : '@',
+    'Address4' => $customerDetails['Address4'] ? $customerDetails['Address4'] : '@',
+    'Postcode' => $customerDetails['Postcode'] ? $customerDetails['Postcode'] : '@',
+    'Website' => $customerDetails['Website'] ? $customerDetails['Website'] : '@',
+    'EC' => $customerDetails['EC'] ? $customerDetails['EC'] : '@',
+    'OutsideEC' => $customerDetails['OutsideEC'] ? $customerDetails['OutsideEC'] : '@',
+    'Notes' => $customerDetails['Notes'] ? $customerDetails['Notes'] : '@',
+    'Source' => $customerDetails['Source'] ? $customerDetails['Source'] : '@',
+    'Discount' => $customerDetails['Discount'] ? $customerDetails['Discount'] : '@',
+    'ShowDiscount' => $customerDetails['ShowDiscount'] ? $customerDetails['ShowDiscount'] : '@',
+    'PaymentTerms' => $customerDetails['PaymentTerms'] ? $customerDetails['PaymentTerms'] : '@',
+    'ExtraText1' => $customerDetails['ExtraText1'] ? $customerDetails['ExtraText1'] : '@',
+    'ExtraText2' => $customerDetails['ExtraText2'] ? $customerDetails['ExtraText2'] : '@',
+    'CheckBox1' => $customerDetails['CheckBox1'] ? $customerDetails['CheckBox1'] : '@',
+    'CheckBox2' => $customerDetails['CheckBox2'] ? $customerDetails['CheckBox2'] : '@',
+    'Created' => $customerDetails['Created'] ? $customerDetails['Created'] : '@',
+    'Updated' => $customerDetails['Updated'] ? $customerDetails['Updated'] : $today,
+    'CurrencyID' => $customerDetails['CurrencyID'] ? $customerDetails['CurrencyID'] : '@'
+  ));
+
+
+  $client = _kashflowapi_get_soap_client();
+
+  $result = $client->UpdateCustomer(array_merge(_kashflowapi_get_login_args() , $customer_args));
+
+  return _kashflowapi_extract_result($result, 'UpdateCustomerResult');
+}
+
+/**
+ * Delete a customer from KashFlow, identified by their unique KashFlow ID
+ *
+ * @param $kfCustID
+ *   the unique kashflow ID of the to-be-deleted customer
+ *
+ * @return
+ *   boolean - true if succeeded, else NULL
+ */
+function kashflowapi_delete_customer($kfCustID) {
+
+  $client = _kashflowapi_get_soap_client();
+
+  $customer_args= array('CustomerID' => $kfCustID);
+
+  $result = $client->DeleteCustomer(array_merge(_kashflowapi_get_login_args() , $customer_args));
+
+  return _kashflowapi_extract_result($result, 'DeleteCustomerResult');
+}
+
+/**
+ * Get all customers from Kashflow
+ *
+ * @return
+ *   an array of objects containing KashFlow customer details, or NULL on error
+ */
+function kashflowapi_get_all_customers() {
+
+  $client = _kashflowapi_get_soap_client();
+
+  $result = $client->GetCustomers(_kashflowapi_get_login_args());
+
+  $GetCustomersResult = _kashflowapi_extract_result($result, 'GetCustomersResult');
+
+  // If the SOAP call was successful then GetCustomersResult is an object that
+  // contains an array called Customer. Return the Customer array if possible.
+  if ($GetCustomersResult && $GetCustomersResult->Customer) {
+    return $GetCustomersResult->Customer;
+  }
+  else {
+    return $GetCustomersResult;
+  }
+}
+
+/**
+ * Add an invoice to KashFlow for a given customer
+ *
+ * The 'InvoiceDate' and 'DueDate' will be set to today's date unless values are
+ * supplied for these keys in the $invoiceDetails parameter.
+ *
+ * @param $kfCustID
+ *   Unique KashFlow customer ID
+ * @param $invoiceDetails
+ *   An array containing values for one or more of the following keys.
+ *   Other keys will be ignored.
+ *   'Discount' =>
+ *   'InvoiceNumber' =>
+ *   'InvoiceDate' =>
+ *   'DueDate' =>
+ *   'Customer' =>
+ *   'CustomerID' =>
+ *   'Paid' =>
+ *   'CustomerReference' =>
+ *   'EstimateCategory' =>
+ *   'SuppressTotal' =>
+ *   'ProjectID' =>
+ *   'CurrencyCode' =>
+ *   'ExchangeRate' =>
+ *   'ReadableString' =>
+ *   'NetAmount' =>
+ *   'VATAmount' =>
+ *   'AmountPaid' =>
+ *
+ * @return
+ *   The invoice number (NOT the unique invoice database ID) of the new invoice
+ *   if it was successfully created in Kashflow, or NULL on error
+ */
+function kashflowapi_add_invoice($kfCustID, $invoiceDetails) {
+
+  if (!$invoiceDetails || !is_array($invoiceDetails) || (count($invoiceDetails)==0)) {
+    kashflowapi_latest_error('Invalid $invoiceDetails array');
+    return NULL;
+  }
+
+  // set the date as now
+  $today = date("Y-m-d", mktime());
+
+  // For an explanation of the @ symbols in this array, look for "@ SYMBOLS:"
+  // in KashFlowSoapClient::__doRequest()
+  $invoiceArgs = array("Inv" => array(
+    'InvoiceDBID' => '@',
+    'Discount' => $customerDetails['Discount'] ? $customerDetails['Discount'] : '@',
+    'InvoiceNumber' => $invoiceDetails['InvoiceNumber'] ? $invoiceDetails['InvoiceNumber'] : '@',
+    'InvoiceDate' => $invoiceDetails['InvoiceDate'] ? $invoiceDetails['InvoiceDate'] : $today,
+    'DueDate' => $invoiceDetails['DueDate'] ? $invoiceDetails['DueDate'] : $today,
+    'Customer' => $invoiceDetails['Customer'] ? $invoiceDetails['Customer'] : '@',
+    'CustomerID' => "$kfCustID",
+    'Paid' => $invoiceDetails['Paid'] ? $invoiceDetails['Paid'] : '@',
+    'CustomerReference' => $invoiceDetails['CustomerReference'] ? $invoiceDetails['CustomerReference'] : '@',
+    'EstimateCategory' => $invoiceDetails['EstimateCategory'] ? $invoiceDetails['EstimateCategory'] : '@',
+    'SuppressTotal' => $invoiceDetails['SuppressTotal'] ? $invoiceDetails['SuppressTotal'] : '@',
+    'ProjectID' => $invoiceDetails['ProjectID'] ? $invoiceDetails['ProjectID'] : '@',
+    'CurrencyCode' => $invoiceDetails['CurrencyCode'] ? $invoiceDetails['CurrencyCode'] : '@',
+    'ExchangeRate' => $invoiceDetails['ExchangeRate'] ? $invoiceDetails['ExchangeRate'] : '@',
+    'ReadableString' => $invoiceDetails['ReadableString'] ? $invoiceDetails['ReadableString'] : '@',
+    'NetAmount' => $invoiceDetails['NetAmount'] ? $invoiceDetails['NetAmount'] : '@',
+    'VATAmount' => $invoiceDetails['VATAmount'] ? $invoiceDetails['VATAmount'] : '@',
+    'AmountPaid' => $invoiceDetails['AmountPaid'] ? $invoiceDetails['AmountPaid'] : '@',
+  ));
+
+  $client = _kashflowapi_get_soap_client();
+
+  $result = $client->InsertInvoice(array_merge(_kashflowapi_get_login_args() , $invoiceArgs));
+
+  return _kashflowapi_extract_result($result, 'InsertInvoiceResult');
+}
+
+/**
+ * Add a line to a given invoice
+ *
+ * @param $kfInvNo
+ *   The number of Invoice in KashFlow. (NOT the unique invoice database ID.)
+ * @param $invoiceLineDetails
+ *   An array containing values for one or more of the following keys.
+ *   Other keys will be ignored.
+ *   'Quantity' =>    Number of units,
+ *   'Description' => Human readable description of invoice line,
+ *   'Rate' =>        Price of one unit, excluding VAT,
+ *   'ChargeType' => ,
+ *   'VatRate' =>     VAT rate as a percentage,
+ *   'VatAmount' => ,
+ *   'ProductID' => ,
+ *   'Sort' => ,
+ *
+ * @return
+ *   The unique ID of the invoice line if successfully created in Kashflow,
+ *   or NULL on error.
+ */
+function kashflowapi_add_invoice_line($kfInvNo, $invoiceLineDetails) {
+
+  if (!$invoiceLineDetails || !is_array($invoiceLineDetails) || (count($invoiceLineDetails)==0)) {
+    kashflowapi_latest_error('Invalid $invoiceLineDetails array');
+    return NULL;
+  }
+
+  // For an explanation of the @ symbols in this array, look for "@ SYMBOLS:"
+  // in KashFlowSoapClient::__doRequest()
+  $lineArgs = array(
+    'Quantity' => $invoiceLineDetails['Quantity'] ? $invoiceLineDetails['Quantity'] : '@',
+    'Description' => $invoiceLineDetails['Description'] ? $invoiceLineDetails['Description'] : '@',
+    'Rate' => $invoiceLineDetails['Rate'] ? $invoiceLineDetails['Rate'] : '@',
+    'ChargeType' => $invoiceLineDetails['ChargeType'] ? $invoiceLineDetails['ChargeType'] : '@',
+    'VatRate' => $invoiceLineDetails['VatRate'] ? $invoiceLineDetails['VatRate'] : '@',
+    'VatAmount' => $invoiceLineDetails['VatAmount'] ? $invoiceLineDetails['VatAmount'] : '@',
+    'ProductID' => $invoiceLineDetails['ProductID'] ? $invoiceLineDetails['ProductID'] : '@',
+    'Sort' => $invoiceLineDetails['Sort'] ? $invoiceLineDetails['Sort'] : '@',
+    'LineID' => $invoiceLineDetails['LineID'] ? $invoiceLineDetails['LineID'] : '@',
+    );
+
+  $args = array(
+    'InvoiceNumber' => "$kfInvNo",
+    'InvLine' => $lineArgs,
+  );
+
+  $client = _kashflowapi_get_soap_client();
+
+  $result = $client->InsertInvoiceLineWithInvoiceNumber(array_merge(_kashflowapi_get_login_args() , $args));
+
+  return _kashflowapi_extract_result($result, 'InsertInvoiceLineWithInvoiceNumberResult');
+}

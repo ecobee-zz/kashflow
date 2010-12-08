@@ -1,0 +1,4 @@
+; $Id:$
+name = Kashflow API
+description = Provide a wrapper over the Kashflow api.
+core = 6.x
